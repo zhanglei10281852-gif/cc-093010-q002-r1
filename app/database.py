@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -235,6 +236,11 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    cancel_confirmed_at TEXT,
+    cancel_closure_path TEXT NOT NULL DEFAULT '' CHECK(cancel_closure_path IN ('','manual','confirmed','timeout')),
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -243,6 +249,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     UNIQUE(requested_by, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at);
+CREATE INDEX IF NOT EXISTS idx_pilot_lease_due ON pilot_sessions(status,lease_expires_at) WHERE lease_expires_at<>'';
 CREATE TABLE IF NOT EXISTS pilot_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES pilot_sessions(id) ON DELETE CASCADE,
@@ -334,7 +341,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_pilot_cancellation(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -360,3 +368,50 @@ def init_db() -> None:
 
 def migrate_db() -> None:
     init_db()
+
+
+def _migrate_pilot_cancellation(connection: sqlite3.Connection) -> None:
+    """补齐取消链路字段，并把历史遗留的 cancel_requested 场次收敛为已取消。"""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+    additions = {
+        "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_reason": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
+        "cancel_confirmed_at": "TEXT",
+        "cancel_closure_path": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE pilot_sessions ADD COLUMN {name} {declaration}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pilot_lease_due ON pilot_sessions(status,lease_expires_at) WHERE lease_expires_at<>''"
+    )
+    legacy = connection.execute(
+        "SELECT * FROM pilot_sessions WHERE status='cancel_requested'"
+    ).fetchall()
+    for row in legacy:
+        intervention = connection.execute(
+            "SELECT actor,reason,created_at FROM pilot_interventions WHERE session_id=? AND action='cancel' ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        actor = intervention["actor"] if intervention else ""
+        reason = intervention["reason"] if intervention else "历史遗留停止请求"
+        requested_at = intervention["created_at"] if intervention else row["updated_at"]
+        connection.execute(
+            "UPDATE pilot_sessions SET status='cancelled',lease_owner='',lease_expires_at='',"
+            "cancel_requested_by=?,cancel_reason=?,cancel_requested_at=?,cancel_closure_path='timeout',"
+            "finished_at=COALESCE(finished_at,?),updated_at=?,version=version+1 WHERE id=?",
+            (actor, reason, requested_at, row["updated_at"], row["updated_at"], row["id"]),
+        )
+        before = {k: row[k] for k in row.keys()}
+        after = dict(connection.execute("SELECT * FROM pilot_sessions WHERE id=?", (row["id"],)).fetchone())
+        connection.execute(
+            "INSERT INTO pilot_interventions(session_id,actor,action,reason,before_json,after_json,batch_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                row["id"], actor or "migration", "lease_recovery", "历史停止请求超时自动取消",
+                json.dumps(before, ensure_ascii=False, sort_keys=True),
+                json.dumps(after, ensure_ascii=False, sort_keys=True),
+                "", row["updated_at"],
+            ),
+        )
