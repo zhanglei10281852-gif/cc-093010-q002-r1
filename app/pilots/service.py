@@ -80,7 +80,36 @@ class PilotOperationsService:
         observation = dict(row)
         observation["observations"] = self.repository.observation_versions(session_id)
         observation["interventions"] = self.repository.interventions(session_id)
+        observation["termination_label"] = self.TERMINATION_LABELS.get(observation.get("termination_kind", ""), "")
+        observation["cancellation"] = {
+            "requested_by": observation["cancel_requested_by"],
+            "reason": observation["cancel_reason"],
+            "requested_at": observation["cancel_requested_at"],
+            "confirmed_at": observation["cancel_confirmed_at"],
+            "timeout_at": observation["cancel_timeout_at"],
+            "path": self._cancel_path(observation),
+        }
         return observation
+
+    @staticmethod
+    def _cancel_path(session: dict[str, Any]) -> str:
+        kind = session.get("termination_kind", "")
+        if kind == "cancelled_confirmed":
+            return "confirmed"
+        if kind == "cancelled_timeout":
+            return "timeout"
+        if kind == "cancelled_direct":
+            return "direct"
+        if session.get("status") == "cancel_requested":
+            return "pending"
+        return ""
+
+    TERMINATION_LABELS = {
+        "completed": "正常完成",
+        "cancelled_direct": "主动停止",
+        "cancelled_confirmed": "主动停止",
+        "cancelled_timeout": "超时停止",
+    }
 
     def claim(self, site_code: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
         now_value = self.clock.now()
@@ -104,6 +133,12 @@ class PilotOperationsService:
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
+            repository = PilotRepository(connection)
+            session = repository.session_by_id(session_id)
+            if session is None:
+                raise NotFoundError("试点体验场次不存在")
+            if session["status"] == "cancel_requested":
+                raise ConflictError("体验场次已请求停止，站点应确认停止而不是续租")
             cursor = connection.execute(
                 "UPDATE pilot_sessions SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
                 (expires, now, session_id, site_code),
@@ -119,6 +154,8 @@ class PilotOperationsService:
             session = repository.session_by_id(session_id)
             if session is None:
                 raise NotFoundError("试点体验场次不存在")
+            if session["status"] == "cancel_requested":
+                raise ConflictError("体验场次已请求停止，观察回执已被阻止，请提交停止确认")
             if session["status"] != "running" or session["lease_owner"] != site_code:
                 raise ConflictError("体验场次未由当前执行站点持有")
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM pilot_observations WHERE session_id=?", (session_id,)).fetchone()[0])
@@ -127,7 +164,7 @@ class PilotOperationsService:
                 (session_id, version, json.dumps(observation, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"observation": observation, "metrics": metrics}), site_code, now),
             )
             connection.execute(
-                "UPDATE pilot_sessions SET status='succeeded',current_observation_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                "UPDATE pilot_sessions SET status='succeeded',termination_kind='completed',current_observation_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, session_id),
             )
             return dict(repository.session_by_id(session_id))
@@ -140,6 +177,8 @@ class PilotOperationsService:
             session = repository.session_by_id(session_id)
             if session is None:
                 raise NotFoundError("试点体验场次不存在")
+            if session["status"] == "cancel_requested":
+                raise ConflictError("体验场次已请求停止，失败上报已被阻止，请提交停止确认")
             if session["status"] != "running" or session["lease_owner"] != site_code:
                 raise ConflictError("体验场次未由当前执行站点持有")
             can_retry = retryable and int(session["attempt_count"]) < int(session["max_attempts"])
@@ -153,14 +192,69 @@ class PilotOperationsService:
             return dict(repository.session_by_id(session_id))
 
     def cancel(self, session_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
-        return self._intervene(session_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
+        def mutate(connection: sqlite3.Connection, session: sqlite3.Row, now: str) -> None:
+            status = session["status"]
+            if status == "cancel_requested":
+                raise ConflictError("停止请求已提交，正在等待执行站点确认")
+            if status not in {"queued", "running"}:
+                raise ConflictError("当前体验场次状态不允许取消")
+            if status == "running":
+                # 进入停止请求态：记录提出者、原因与时间，保留租约信息用于站点确认或超时收敛。
+                connection.execute(
+                    "UPDATE pilot_sessions SET status='cancel_requested',cancel_requested_at=?,"
+                    "cancel_requested_by=?,cancel_reason=?,updated_at=?,version=version+1 WHERE id=?",
+                    (now, actor, reason, now, session["id"]),
+                )
+            else:
+                connection.execute(
+                    "UPDATE pilot_sessions SET status='cancelled',termination_kind='cancelled_direct',"
+                    "finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                    (now, now, session["id"]),
+                )
+
+        return self._intervene(session_id, actor, reason, "cancel", batch_key, mutate)
+
+    def confirm_cancel(self, session_id: int, site_code: str) -> dict[str, Any]:
+        """执行站点确认停止：仅停止请求态、且租约仍由该站点持有时可以确认。"""
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        with transaction(immediate=True) as connection:
+            repository = PilotRepository(connection)
+            session = repository.session_by_id(session_id)
+            if session is None:
+                raise NotFoundError("试点体验场次不存在")
+            if session["status"] != "cancel_requested":
+                raise ConflictError("体验场次没有等待确认的停止请求")
+            if session["lease_owner"] != site_code:
+                raise ConflictError("停止请求只能由当前执行站点确认")
+            if session["lease_expires_at"] and session["lease_expires_at"] < now:
+                raise ConflictError("站点租约已过期，场次将按超时停止收敛")
+            before = dict(session)
+            connection.execute(
+                "UPDATE pilot_sessions SET status='cancelled',termination_kind='cancelled_confirmed',"
+                "cancel_confirmed_at=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (now, now, now, session_id),
+            )
+            after = dict(repository.session_by_id(session_id))
+            repository.add_intervention(
+                session_id=session_id, actor=site_code, action="cancel_confirmed",
+                reason=f"站点确认停止：{session['cancel_reason']}" if session["cancel_reason"] else "站点确认停止",
+                before=before, after=after, batch_key="", now=now,
+            )
+            return after
 
     def retry(self, session_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
         def mutate(connection: sqlite3.Connection, session: sqlite3.Row, now: str) -> None:
             if session["status"] not in {"failed", "cancelled"}:
                 raise ConflictError("只有失败或已取消体验场次可以人工重试")
             chosen = session["priority"] if priority is None else priority
-            connection.execute("UPDATE pilot_sessions SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, session["id"]))
+            connection.execute(
+                "UPDATE pilot_sessions SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',"
+                "finished_at=NULL,cancel_requested_at='',cancel_requested_by='',cancel_reason='',"
+                "cancel_confirmed_at='',cancel_timeout_at='',termination_kind='',"
+                "updated_at=?,version=version+1 WHERE id=?",
+                (chosen, now, now, session["id"]),
+            )
         return self._intervene(session_id, actor, reason, "retry", batch_key, mutate)
 
     def set_priority(self, session_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
@@ -191,24 +285,50 @@ class PilotOperationsService:
         now = to_storage(self.clock.now())
         recovered: list[int] = []
         exhausted: list[int] = []
+        cancel_timeouts: list[int] = []
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
-            rows = connection.execute("SELECT * FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
+            rows = connection.execute(
+                "SELECT * FROM pilot_sessions WHERE status IN ('running','cancel_requested') "
+                "AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id",
+                (now,),
+            ).fetchall()
             for session in rows:
                 before = dict(session)
-                if int(session["attempt_count"]) < int(session["max_attempts"]):
+                if session["status"] == "cancel_requested":
+                    # 停止请求未获站点确认且租约过期：确定地收敛为超时取消，绝不重新排队。
+                    status, finished_at = "cancelled", now
+                    cancel_timeouts.append(int(session["id"]))
+                    connection.execute(
+                        "UPDATE pilot_sessions SET status='cancelled',termination_kind='cancelled_timeout',"
+                        "cancel_timeout_at=?,lease_owner='',lease_expires_at='',available_at=?,"
+                        "finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                        (now, now, finished_at, now, session["id"]),
+                    )
+                    action, reason = "cancel_timeout_recovery", "停止请求未获站点确认，租约过期后自动取消"
+                elif int(session["attempt_count"]) < int(session["max_attempts"]):
                     status, finished_at = "queued", None
                     recovered.append(int(session["id"]))
+                    connection.execute(
+                        "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,"
+                        "last_error_code='lease_expired',last_error_message='执行站点租约已过期',"
+                        "finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                        (status, now, finished_at, now, session["id"]),
+                    )
+                    action, reason = "lease_recovery", "租约过期自动恢复"
                 else:
                     status, finished_at = "failed", now
                     exhausted.append(int(session["id"]))
-                connection.execute(
-                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='执行站点租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, session["id"]),
-                )
+                    connection.execute(
+                        "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,"
+                        "last_error_code='lease_expired',last_error_message='执行站点租约已过期',"
+                        "finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                        (status, now, finished_at, now, session["id"]),
+                    )
+                    action, reason = "lease_recovery", "租约过期自动恢复"
                 after = dict(repository.session_by_id(session["id"]))
-                repository.add_intervention(session_id=session["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
-        return {"recovered": recovered, "exhausted": exhausted}
+                repository.add_intervention(session_id=session["id"], actor=actor, action=action, reason=reason, before=before, after=after, batch_key="", now=now)
+        return {"recovered": recovered, "exhausted": exhausted, "cancel_timeouts": cancel_timeouts}
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM pilot_sessions GROUP BY status ORDER BY status").fetchall()
@@ -227,13 +347,6 @@ class PilotOperationsService:
             after = dict(repository.session_by_id(session_id))
             repository.add_intervention(session_id=session_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
             return after
-
-    @staticmethod
-    def _cancel_mutation(connection: sqlite3.Connection, session: sqlite3.Row, now: str) -> None:
-        if session["status"] not in {"queued", "running"}:
-            raise ConflictError("当前体验场次状态不允许取消")
-        status = "cancel_requested" if session["status"] == "running" else "cancelled"
-        connection.execute("UPDATE pilot_sessions SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, session["id"]))
 
     def _check_quota(self, repository: PilotRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)

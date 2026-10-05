@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -235,6 +236,12 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_confirmed_at TEXT NOT NULL DEFAULT '',
+    cancel_timeout_at TEXT NOT NULL DEFAULT '',
+    termination_kind TEXT NOT NULL DEFAULT '' CHECK(termination_kind IN ('','completed','cancelled_direct','cancelled_confirmed','cancelled_timeout')),
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -334,7 +341,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_pilot_cancellations(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -355,6 +363,74 @@ def init_db() -> None:
         connection.execute(
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
+        )
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_pilot_cancellations(connection: sqlite3.Connection) -> None:
+    """为取消链路补齐列，并将旧的 cancel_requested 死状态确定性收敛。
+
+    幂等：每次启动都会执行；列已存在或场次已处于终态时不产生任何改动。
+    """
+    columns = _column_names(connection, "pilot_sessions")
+    additions = {
+        "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_reason": "TEXT NOT NULL DEFAULT ''",
+        "cancel_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+        "cancel_timeout_at": "TEXT NOT NULL DEFAULT ''",
+        "termination_kind": "TEXT NOT NULL DEFAULT '' CHECK(termination_kind IN ('','completed','cancelled_direct','cancelled_confirmed','cancelled_timeout'))",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE pilot_sessions ADD COLUMN {name} {declaration}")
+
+    # 从最早一条取消干预回填提出者、原因和请求时间（旧库只有干预流水里有这些信息）。
+    connection.execute(
+        """
+        UPDATE pilot_sessions
+        SET cancel_requested_by = COALESCE(NULLIF(cancel_requested_by, ''),
+                (SELECT actor FROM pilot_interventions pi WHERE pi.session_id=pilot_sessions.id AND pi.action='cancel' ORDER BY pi.id DESC LIMIT 1)),
+            cancel_reason = COALESCE(NULLIF(cancel_reason, ''),
+                (SELECT reason FROM pilot_interventions pi WHERE pi.session_id=pilot_sessions.id AND pi.action='cancel' ORDER BY pi.id DESC LIMIT 1)),
+            cancel_requested_at = COALESCE(NULLIF(cancel_requested_at, ''),
+                (SELECT created_at FROM pilot_interventions pi WHERE pi.session_id=pilot_sessions.id AND pi.action='cancel' ORDER BY pi.id DESC LIMIT 1))
+        WHERE status IN ('cancel_requested', 'cancelled')
+        """
+    )
+    # 历史终态补分类：succeeded=正常完成；旧库的 cancelled 只可能来自排队态直取消。
+    connection.execute(
+        "UPDATE pilot_sessions SET termination_kind='completed' WHERE status='succeeded' AND termination_kind=''"
+    )
+    connection.execute(
+        "UPDATE pilot_sessions SET termination_kind='cancelled_direct' WHERE status='cancelled' AND termination_kind=''"
+    )
+
+    # 启动自愈：旧版本遗留的 cancel_requested 若租约已过期，按“超时停止”收敛而不是重新排队。
+    now = to_storage(utc_now())
+    stuck = connection.execute(
+        "SELECT * FROM pilot_sessions WHERE status='cancel_requested' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id",
+        (now,),
+    ).fetchall()
+    for session in stuck:
+        before = dict(session)
+        connection.execute(
+            "UPDATE pilot_sessions SET status='cancelled',termination_kind='cancelled_timeout',"
+            "cancel_timeout_at=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+            (now, now, now, session["id"]),
+        )
+        after = connection.execute("SELECT * FROM pilot_sessions WHERE id=?", (session["id"],)).fetchone()
+        connection.execute(
+            "INSERT INTO pilot_interventions(session_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                session["id"], "recovery-site", "cancel_timeout_recovery", "停止请求未获站点确认，租约过期后自动取消",
+                json.dumps(before, ensure_ascii=False, sort_keys=True),
+                json.dumps(dict(after), ensure_ascii=False, sort_keys=True),
+                "", now,
+            ),
         )
 
 
